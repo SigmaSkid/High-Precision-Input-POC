@@ -20,28 +20,27 @@ struct MouseEvent {
     std::chrono::high_resolution_clock::time_point timestamp;
     // 0 - none, 1 - changed to down, 2 - changed to up
     INT leftMouseState;
-
-    void printData()
-    {
-        std::cout
-            << "H: " << horizontal << std::endl
-            << "V: " << vertical << std::endl
-            << "L: " << leftMouseState << std::endl
-            << "T: " << std::chrono::duration_cast<std::chrono::microseconds>(timestamp - TheBeginningOfTime).count() << std::endl
-            << std::endl;
-    }
 };
 
-// is there any reason for this being a DWORD WINAPI? no.
-DWORD WINAPI TickHandler();
-DWORD WINAPI DataCollector();
-std::vector<MouseEvent> MouseEvents;
-std::mutex mouseEventsMutex;
+struct ImportantEvent {
+    // we only care about shots being ultra accurate so
+    double yaw = 0.;
+    double pitch = 0.;
+    std::chrono::high_resolution_clock::time_point timestamp;
+};
+
+// i'm not doing proper networking for this stuff
+struct SimplifiedDataPacket {
+    std::vector<ImportantEvent> shots;
+    // and all the other useless data cs2 sends to the server each tick
+};
 
 struct BasedPlayer {
-    double yaw = 0.f;
-    double pitch = 0.f;
-    BOOL leftMouseDown = FALSE;
+    double yaw = 0.;
+    double pitch = 0.;
+    BOOL leftMouseDown = false;
+    // could also be done for scoping to get the accurate accuracy penalty
+    // but i'm too lazy to add that in this POC
 
     void normalizeViewAngles()
     {
@@ -53,7 +52,17 @@ struct BasedPlayer {
     }
 };
 
+// is there any reason for this being a DWORD WINAPI? no.
+DWORD WINAPI TickHandler();
+DWORD WINAPI ServerWannabe();
+DWORD WINAPI DataCollector();
+std::vector<MouseEvent> MouseEvents;
+std::mutex mouseEventsMutex;
+std::vector<SimplifiedDataPacket> OurImaginaryBasedNetworkingStack;
+std::mutex realisticNetworkMutex;
 BasedPlayer localPlayer;
+BOOL UserForceQuitCollector = FALSE;
+HWND hwnd;
 
 int main()
 {
@@ -61,23 +70,24 @@ int main()
     LastShotTime = TheBeginningOfTime;
 
     std::thread a1(TickHandler); 
-    std::thread a2(DataCollector); 
+    std::thread a2(DataCollector);
+    std::thread a3(ServerWannabe);
 
     // will never happen :) 
     // you can put an infinite loop here instead
-    a1.join(); a2.join();
+    a1.join(); a2.join(); a3.join();
 
-    // or here, yes. fabulous.
-    for (;;);
+    for (;;)
+    system("pause");
 
     return -1;
 }
 
-std::string DataMuncher(std::vector<MouseEvent>& events)
+std::vector<ImportantEvent> DataMuncher(std::vector<MouseEvent>& mouseEvents)
 {
-    std::stringstream output;
+    std::vector<ImportantEvent> ImportantEvents;
 
-    for (const auto& me : events)
+    for (const auto& me : mouseEvents)
     {
         if (me.leftMouseState == 1)
         {
@@ -88,16 +98,21 @@ std::string DataMuncher(std::vector<MouseEvent>& events)
             localPlayer.leftMouseDown = FALSE;
         }
 
+        auto delta = MeasureTimeDeltaMS(me.timestamp - LastShotTime);
+
         if (localPlayer.leftMouseDown &&
             // shot every 100ms, cuz ak47 is 600rpm
-            MeasureTimeDeltaMS(me.timestamp - LastShotTime) >= 100)
+            delta >= 100)
         {
             localPlayer.normalizeViewAngles();
 
-            output << "Shot! Yaw: " << localPlayer.yaw
-                << " Pitch: " << localPlayer.pitch
-                << " Time: " << MeasureTimeDeltaMS(me.timestamp - TheBeginningOfTime) << " ms since launch"
-            << std::endl;
+            // we shoot at this timestamp, (that's between frames), and start rendering our shot on this frame already
+            ImportantEvent event_;
+            event_.pitch = localPlayer.pitch;
+            event_.yaw = localPlayer.yaw;
+            event_.timestamp = me.timestamp;
+
+            ImportantEvents.push_back(event_);
 
             LastShotTime = me.timestamp;
         }
@@ -116,15 +131,16 @@ std::string DataMuncher(std::vector<MouseEvent>& events)
 
     if (localPlayer.leftMouseDown && time_delta >= 100)
     {
-        output << "Shot! Yaw: " << localPlayer.yaw
-            << " Pitch: " << localPlayer.pitch
-            << " Time: " << time_delta
-            << std::endl;
+        ImportantEvent event_;
+        event_.pitch = localPlayer.pitch;
+        event_.yaw = localPlayer.yaw;
+        event_.timestamp = now;
 
+        ImportantEvents.push_back(event_);
         LastShotTime = now;
     }
 
-    return output.str();
+    return ImportantEvents;
 }
 
 // cs2 subtick wannabe
@@ -132,6 +148,9 @@ DWORD WINAPI TickHandler()
 {
     std::vector<MouseEvent> MouseEventsCopy;
     std::chrono::high_resolution_clock::time_point last = std::chrono::high_resolution_clock::now();
+
+    // wait for the raw input window to be created.
+    while (!IsWindow(hwnd)) Sleep(1);
 
     for (;;)
     {
@@ -146,8 +165,13 @@ DWORD WINAPI TickHandler()
 
         last = now;
 
-        MouseEventsCopy.clear();
+        UserForceQuitCollector = !IsWindow(hwnd);
+
+        if (UserForceQuitCollector)
+            break;
+
         {
+            MouseEventsCopy.clear();
             // Lock the mutex before accessing shared data
             std::lock_guard<std::mutex> guard(mouseEventsMutex);
             MouseEventsCopy = MouseEvents;
@@ -156,20 +180,28 @@ DWORD WINAPI TickHandler()
 
         std::stringstream output;
 
-        // this part uses naive sleep, so it's a lil inaccurate but who cares, so is subtick in cs2
-        output << "Just a reminder that this proof of concept creates a transparent fullscreen window, use alt+f4 if you need to exit" << std::endl;
-        output << "Received " << MouseEventsCopy.size() << " since last tick." << std::endl;
+        // output << "Just a reminder that this proof of concept creates a transparent fullscreen window, use alt+f4 if you need to exit" << std::endl;
+        // who needs these disclaimers being printed anyway, am i right?
+
+        output << "Received " << MouseEventsCopy.size() << " mouse events since last tick." << std::endl;
 
         // also updates yaw and pitch, so print these first
-        std::string shot_data = DataMuncher(MouseEventsCopy);
+        SimplifiedDataPacket HilariousPacket;
 
-        output << "Current YAW: " << localPlayer.yaw << std::endl;
-        output << "Current PITCH: " << localPlayer.pitch << std::endl;
+        HilariousPacket.shots = DataMuncher(MouseEventsCopy);
 
-        output << shot_data;
+        output << "Current YAW: " << localPlayer.yaw << "   PITCH: " << localPlayer.pitch << std::endl << std::endl << std::endl;
 
-        std::system("cls");
+
+        // imagine you're playing the game, while seeing numbers that represent it.
+        // imagine that my proof of concept project looks more photorealistic than any game you have ever seen.
         std::cout << output.str();
+        
+        // *send* the data over our imaginary network *hotline*
+        {
+            std::lock_guard<std::mutex> guard(realisticNetworkMutex);
+            OurImaginaryBasedNetworkingStack.push_back(HilariousPacket);
+        }
 
         // now do the other shit, like render the game poorly etc.
     }
@@ -185,15 +217,16 @@ LRESULT CALLBACK RawInputProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
 
         if (raw.header.dwType == RIM_TYPEMOUSE) {
             // Process mouse input
+
             MouseEvent me;
             me.horizontal = raw.data.mouse.lLastX;
             me.vertical = raw.data.mouse.lLastY;
             me.timestamp = std::chrono::high_resolution_clock::now();
-            me.leftMouseState = 0;
 
+            me.leftMouseState = 0;
             if ((raw.data.mouse.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN) != 0) me.leftMouseState = 1;
             if ((raw.data.mouse.usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP) != 0) me.leftMouseState = 2;
-
+            
             {
                 // Lock the mutex before accessing shared data
                 std::lock_guard<std::mutex> guard(mouseEventsMutex);
@@ -207,6 +240,7 @@ LRESULT CALLBACK RawInputProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
             int screenHeight = GetSystemMetrics(SM_CYSCREEN);
             SetCursorPos(screenWidth / 2, screenHeight / 2);
         }
+
     }
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
@@ -224,7 +258,6 @@ void InitializeRawInput(HWND hwnd) {
     }
 }
 
-HWND hwnd;
 
 // overwatch HPMI wannabe
 DWORD WINAPI DataCollector()
@@ -269,6 +302,62 @@ DWORD WINAPI DataCollector()
     while (GetMessage(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
+    }
+
+    return 0;
+}
+
+// highly realistic networking stack
+DWORD WINAPI ServerWannabe() {
+
+    std::chrono::high_resolution_clock::time_point last = std::chrono::high_resolution_clock::now();
+
+    for (;;)
+    {        
+        // Get current time
+        std::chrono::high_resolution_clock::time_point now = std::chrono::high_resolution_clock::now();
+        auto delta = now - last;
+        auto ms = std::chrono::duration_cast<std::chrono::microseconds>(delta).count();
+
+        // wait for next tick/frame (which isn't real in this POC)
+        if (ms < (1. / simulated_tickrate) * 1000 * 1000)
+            continue;
+
+        last = now;
+        INT size = 0;
+
+        {
+            std::lock_guard<std::mutex> guard(realisticNetworkMutex);
+            size = OurImaginaryBasedNetworkingStack.size();
+            if (size == 0)
+                continue;
+        }
+        
+        for (int i = 0; i < size; i++) {
+
+            SimplifiedDataPacket bigData;
+
+            {
+                std::lock_guard<std::mutex> guard(realisticNetworkMutex);
+                if (OurImaginaryBasedNetworkingStack.size() == 0)
+                    break;
+
+                bigData = OurImaginaryBasedNetworkingStack.front();
+                OurImaginaryBasedNetworkingStack.erase(OurImaginaryBasedNetworkingStack.begin());
+            }
+
+            for (const auto& shot : bigData.shots)
+            {
+                // do the shooty shoot and interpolate the players using the shots timestamp,
+                // in the case of a real server using a chrono timestamp is dumb af, so just do a double with the
+                // amount of interpolation needed between player positions in tick A and tick B
+                // something along the lines of InterpolatePos(PosA, PosB, Fraction)
+                std::cout << "Server registered the shot!" << std::endl;
+
+            }
+        }
+        if (UserForceQuitCollector)
+            break;
     }
 
     return 0;
