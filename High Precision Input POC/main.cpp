@@ -8,11 +8,13 @@
 
 // this proof of concept assumes an automatic weapon.
 
-// adjust it for yourself, I use 20k dpi, this POC utilizes raw input!
-#define sensitivity 0.0001
+// adjust it for yourself, I use 1k dpi, 
+// keep in mind that this POC utilizes raw input!
+#define sensitivity 0.002
 // low tickrate makes it easy to read debug logs in real time.
 // also it demonstrates pretty well, why this input method is based, as inputs
-// even with the tickrate of 1, will be as precise as they can be.
+// even with the tickrate of 1 or 0.1, will be as precise as they can be.
+// I recommend values of 64 or lower.
 #define simulated_tickrate 1
 // ak47 - 600
 #define RPM 600
@@ -85,6 +87,7 @@ std::vector<MouseEvent> MouseEvents;
 std::mutex mouseEventsMutex;
 std::vector<SimplifiedDataPacket> OurImaginaryBasedNetworkingStack;
 std::mutex realisticNetworkMutex;
+std::mutex consoleOutputMutex;
 BasedPlayer localPlayer;
 BOOL UserForceQuitCollector = FALSE;
 HWND hwnd;
@@ -266,27 +269,80 @@ std::vector<ImportantEvent> DataMuncher(std::vector<MouseEvent>& mouseEvents)
     return ImportantEvents;
 }
 
+// use this if you don't care about performance and want the ticks to happen precisely when they should.
+bool PreciseButExpensiveTimer(std::chrono::high_resolution_clock::time_point& timeTarget)
+{
+    return timeTarget > std::chrono::high_resolution_clock::now();
+}
+
+// our precise timer used to wait for ticks :)
+bool HighQualityTimingUtilityTrustMeBro(std::chrono::high_resolution_clock::time_point& timeTarget)
+{
+    // get current time
+    std::chrono::high_resolution_clock::time_point now = std::chrono::high_resolution_clock::now();
+    
+    // get time between the target and when we're now.
+    std::chrono::nanoseconds delta = timeTarget - now;
+
+    // convert from nano seconds to long representing amount of microseconds.
+    long long ms = std::chrono::duration_cast<std::chrono::microseconds>(delta).count();
+
+    // the next frame/tick should happen NOW
+    if (ms <= 0) {
+        // set the next tick target, to last target + delta
+        timeTarget = timeTarget + std::chrono::microseconds(tickDelta);
+        return false;
+    }
+
+    // if we need to wait less than 500 micro seconds. spin lock
+    if (ms < 500)
+        return true;
+
+
+    // we have to wait... for more than a second? well, nice tickrate of below 1.
+    if (ms > 1000000)
+    {
+        std::this_thread::sleep_for(std::chrono::microseconds(ms - 2000));
+
+        return true;
+    }
+
+    // use low latency sleep instead of spin locking.
+    // it's not very precise, but it's much cheaper than spin lock
+    std::this_thread::sleep_for(std::chrono::nanoseconds(250));
+
+    // repeat.
+    return true;
+}
+
+
 // cs2 subtick wannabe
 DWORD WINAPI TickHandler()
 {
     std::vector<MouseEvent> MouseEventsCopy;
-    std::chrono::high_resolution_clock::time_point last = std::chrono::high_resolution_clock::now();
+    std::chrono::high_resolution_clock::time_point now = std::chrono::high_resolution_clock::now();
+    std::chrono::high_resolution_clock::time_point tickTargetTime = now + std::chrono::microseconds(tickDelta);
 
     // wait for the raw input window to be created.
     while (!IsWindow(hwnd)) Sleep(1);
 
     for (;;)
     {
-        // Get current time
-        std::chrono::high_resolution_clock::time_point now = std::chrono::high_resolution_clock::now();
-        auto delta = now - last;
-        auto ms = std::chrono::duration_cast<std::chrono::microseconds>(delta).count();
-
-        // wait for next tick/frame (which isn't real in this POC)
-        if (ms < tickDelta)
+        if (HighQualityTimingUtilityTrustMeBro(tickTargetTime))
             continue;
 
-        last = now;
+        // create console output ss
+        std::stringstream output;
+
+        // store last tick time.
+        auto last = now;
+
+        // Get current time
+        now = std::chrono::high_resolution_clock::now();
+
+        // used for debugging tick timing precision
+        std::chrono::nanoseconds delta = now - last;
+        output << "time since last tick: " << delta.count() / 1000. / 1000. << " milliseconds." << std::endl;
 
         UserForceQuitCollector = !IsWindow(hwnd);
 
@@ -300,8 +356,6 @@ DWORD WINAPI TickHandler()
             MouseEventsCopy = MouseEvents;
             MouseEvents.clear();
         }
-
-        std::stringstream output;
 
         // output << "Just a reminder that this proof of concept creates a transparent fullscreen window, use alt+f4 if you need to exit" << std::endl;
         // who needs these disclaimers being printed anyway, am i right?
@@ -345,8 +399,10 @@ DWORD WINAPI TickHandler()
 
         // imagine you're playing the game, while seeing numbers that represent it.
         // imagine that my proof of concept project looks more photorealistic than any game you have ever seen.
-        std::cout << output.str();
-
+        {
+            std::lock_guard<std::mutex> guard(consoleOutputMutex);
+            std::cout << output.str();
+        }
 
         // now do the other shit, like render the game poorly etc.
         // if we started shooting between frames/ticks you can interpolate the shooting animation
@@ -457,20 +513,16 @@ DWORD WINAPI DataCollector()
 // highly realistic networking stack
 DWORD WINAPI ServerWannabe() {
 
-    std::chrono::high_resolution_clock::time_point last = std::chrono::high_resolution_clock::now();
+    std::chrono::high_resolution_clock::time_point tickTargetTime = std::chrono::high_resolution_clock::now() + std::chrono::microseconds(tickDelta);
 
     for (;;)
     {        
-        // Get current time
-        std::chrono::high_resolution_clock::time_point now = std::chrono::high_resolution_clock::now();
-        auto delta = now - last;
-        auto ms = std::chrono::duration_cast<std::chrono::microseconds>(delta).count();
-
-        // wait for next tick/frame (which isn't real in this POC)
-        if (ms < tickDelta)
+        if (HighQualityTimingUtilityTrustMeBro(tickTargetTime))
             continue;
 
-        last = now;
+        // create console output ss
+        std::stringstream output;
+
         INT size = 0;
 
         {
@@ -493,6 +545,7 @@ DWORD WINAPI ServerWannabe() {
                 OurImaginaryBasedNetworkingStack.erase(OurImaginaryBasedNetworkingStack.begin());
             }
 
+            output << "[][][] SERVER OUT [][][]" << std::endl;
             for (const auto& shot : bigData.shots)
             {
                 // do the shooty shoot and interpolate the players using the shots timestamp,
@@ -502,11 +555,11 @@ DWORD WINAPI ServerWannabe() {
                 // something along the lines of InterpolatePos(PosA, PosB, Fraction)
                 // obviously remember to also interpolate the shooting position, even tho, it probably really doesn't matter
                 // cuz if you're moving you're prolly gonna miss anyway in the case of cs2.
-                std::cout << "Server registered the shot!" << std::endl
+                output << "registered shot"
                           << "  Yaw: "    << shot.yaw 
                           << "  Pitch: "  << shot.pitch 
                           << "  Time: "   << MeasureTimeDeltaMS(shot.timestamp - TheBeginningOfTime) 
-                          << std::endl << std::endl;
+                          << std::endl;
 
                 // if you're paranoid and want to feed your AI anticheat more data,
                 // you could just send all of the mouse inputs, but imho it's a waste of cpu time, storage, bandwidth etc.
@@ -514,7 +567,15 @@ DWORD WINAPI ServerWannabe() {
                 // to check whether we could actually have shot during these timestamps, to prevent abuse of this system.
                 // I'm sure the AI would love all of that data tho...
             }
+            output << "[][][] SERVER END [][][]" << std::endl << std::endl;
         }
+
+        // imagine this is the feedback of the game...
+        {
+            std::lock_guard<std::mutex> guard(consoleOutputMutex);
+            std::cout << output.str();
+        }
+
         if (UserForceQuitCollector)
             break;
     }
